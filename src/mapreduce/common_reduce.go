@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"bufio"
+	"encoding/json"
+	"log"
+	"os"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -7,6 +14,34 @@ func doReduce(
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
 ) {
+	vals := make(map[string][]string)
+	for i := 0; i < nMap; i++ {
+		f, err := os.Open(reduceName(jobName, i, reduceTask))
+		if err != nil {
+			log.Fatal("Reduce[Read]: ", err)
+			panic(err)
+		}
+
+		dec := json.NewDecoder(bufio.NewReader(f))
+		var kv KeyValue
+		for dec.Decode(&kv) == nil {
+			vals[kv.Key] = append(vals[kv.Key], kv.Value)
+		}
+		f.Close()
+	}
+
+	f, err := os.Create(outFile)
+	if err != nil {
+		log.Fatal("Reduce[Write]: ", err)
+	}
+	w := bufio.NewWriter(f)
+	enc := json.NewEncoder(w)
+
+	for k, v := range vals {
+		enc.Encode(KeyValue{k, reduceF(k, v)})
+	}
+	w.Flush()
+	f.Close()
 	//
 	// doReduce manages one reduce task: it should read the intermediate
 	// files for the task, sort the intermediate key/value pairs by key,

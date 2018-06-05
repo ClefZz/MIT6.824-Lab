@@ -1,8 +1,43 @@
 package mapreduce
 
 import (
+	"bufio"
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
+	"sort"
 )
+
+type KInt struct {
+	Key string
+	Value int
+}
+
+func Min(i, j int) int {
+	if i < j {
+		return i
+	} else {
+		return j
+	}
+}
+
+type KInts []KInt
+
+func (kvs KInts) Len() int      { return len(kvs) }
+func (kvs KInts) Swap(i, j int) { kvs[i], kvs[j] = kvs[j], kvs[i] }
+func (kvs KInts) Less(i, j int) bool {
+	k1, k2 := kvs[i].Key, kvs[j].Key
+	for i, bound := 0, Min(len(k1), len(k2)); i < bound; i++ {
+		if k1[i] < k2[i] {
+			return true
+		} else if k1[i] > k2[i] {
+			return false
+		}
+	}
+	return len(k1) < len(k2)
+}
 
 func doMap(
 	jobName string, // the name of the MapReduce job
@@ -11,6 +46,44 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(filename string, contents string) []KeyValue,
 ) {
+	dat, err := ioutil.ReadFile(inFile)
+	if err != nil {
+		log.Fatal("Map[Read]: ", err)
+		panic(err)
+	}
+
+	pars := make([][]KInt, nReduce)
+	kvs := mapF(inFile, string(dat))
+
+	// partition
+	for i, kv := range kvs {
+		parIdx := ihash(kv.Key) % nReduce
+		pars[parIdx] = append(pars[parIdx], KInt{kv.Key, i})
+	}
+
+	// sort
+	for i, keys := range pars {
+		if keys == nil {
+			continue
+		}
+
+		f, err := os.Create(reduceName(jobName, mapTask, i))
+		if err != nil {
+			log.Fatal("Map[Write]: ", err)
+			panic(err)
+		}
+
+		w := bufio.NewWriter(f)
+		enc := json.NewEncoder(w)
+
+		sort.Sort(KInts(keys))
+
+		for _, key := range keys {
+			enc.Encode(&kvs[key.Value])
+		}
+		w.Flush()
+		f.Close()
+	}
 	//
 	// doMap manages one map task: it should read one of the input files
 	// (inFile), call the user-defined map function (mapF) for that file's
