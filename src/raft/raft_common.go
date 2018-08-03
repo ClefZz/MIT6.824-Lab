@@ -1,30 +1,20 @@
 package raft
 
 import (
-	"math/rand"
+	"sync/atomic"
+	"unsafe"
 	"time"
+	"math/rand"
+	"labrpc"
 )
 
 const (
-	OperationSucceed = 0
-	CallFail         = -1
-	AppendRollback   = -2
-	VoteDenied       = -3
-	Fallback         = -4
+	_MsgAppend      = "append"
+	_MsgRequest     = "request"
+	_MsgQuery       = "query"
+	_MsgGreaterTerm = "greater_term"
+	_MsgTimeout     = "timeout"
 )
-
-type commandTask struct {
-	command interface{}
-	index   chan int
-}
-
-func electionTimeOut() <-chan time.Time {
-	return time.After(time.Duration(rand.Int()%200+200) * time.Millisecond)
-}
-
-func heartBeatTimeOut() <-chan time.Time {
-	return time.After(time.Duration(125) * time.Millisecond)
-}
 
 type AppendArgs struct {
 	Term         int
@@ -36,15 +26,10 @@ type AppendArgs struct {
 }
 
 type AppendReply struct {
-	Term           int
-	PrevKnownTerm  int
-	PrevKnownIndex int
-	Success        bool
-}
-
-type ACall struct {
-	args  *AppendArgs
-	reply chan *AppendReply
+	Term          int
+	BaselineTerm  int
+	BaselineIndex int
+	Success       bool
 }
 
 type RequestArgs struct {
@@ -59,9 +44,32 @@ type RequestReply struct {
 	VoteGranted bool
 }
 
-type RCall struct {
-	args  *RequestArgs
-	reply chan *RequestReply
+const _StartWork = -1
+const _NetworkTimeout = 250 * time.Millisecond
+const _HeartbeatTimeout = 175 * time.Millisecond
+
+func electionTimeOut() time.Duration {
+	return time.Duration(rand.Int()%350+350) * time.Millisecond
+}
+
+func eventFilter(msg *eventMsg) bool {
+	return msg.msgType == _MsgAppend ||
+		msg.msgType == _MsgRequest ||
+		msg.msgType == _MsgQuery
+}
+
+func tryCall(peer *labrpc.ClientEnd, svcMeth string, args interface{}, reply interface{}) bool {
+	ch := make(chan bool, 1)
+	go func() {
+		ch <- peer.Call(svcMeth, args, reply)
+	}()
+
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(_NetworkTimeout):
+		return false
+	}
 }
 
 func (rf *Raft) DPrintf(format string, a ...interface{}) {
@@ -70,188 +78,154 @@ func (rf *Raft) DPrintf(format string, a ...interface{}) {
 	DPrintf("[%v, %v] "+format, args...)
 }
 
-func (rf *Raft) lastLog() *Log {
-	if len(rf.logs) <= 0 {
-		return nil
-	} else {
-		return &rf.logs[len(rf.logs)-1]
-	}
+func (rf *Raft) nextFakeIndex() int {
+	rf.fakeIndex++
+	return rf.fakeIndex
 }
 
-func (rf *Raft) lastIndex() int {
-	if lastLog := rf.lastLog(); lastLog != nil {
-		return lastLog.Index
-	} else {
-		return -1
-	}
-}
-
-func (rf *Raft) drainCommandQueue() {
-	for {
-		select {
-		case <-rf.commandQueue:
-		default:
-			return
+// Updates fake index as the last valid one in `logs`.
+func (rf *Raft) updateFakeIndex() {
+	for i := len(rf.logs) - 1; i >= 0; i-- {
+		if log := rf.logs[i]; log.FakeIndex != 0 {
+			rf.fakeIndex = log.FakeIndex
+			break
 		}
 	}
+}
+
+func (rf *Raft) setCharacter(c character) {
+	atomic.StorePointer(&rf.currentCharacter, unsafe.Pointer(&c))
+}
+
+func (rf *Raft) getCharacter() character {
+	return *(*character)(atomic.LoadPointer(&rf.currentCharacter))
 }
 
 func (rf *Raft) commit() {
-	if rf.commitIndex > rf.lastAppied {
-		if rf.logs[rf.commitIndex].Term < rf.currentTerm {
-			return
-		}
-		//rf.DPrintf("committing logs between %v and %v", rf.lastAppied, rf.commitIndex)
-		i, bound := findLogOfIndex(rf, rf.lastAppied)+1, findLogOfIndex(rf, rf.commitIndex)
-		for ; i <= bound; i++ {
-			log := rf.logs[i]
+	if rf.commitIndex > rf.lastApplied {
+		for _, log := range rf.logs[rf.getLogOffsetByIndex(rf.lastApplied)+1 : rf.getLogOffsetByIndex(rf.commitIndex)+1] {
 			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
+				CommandValid: log.FakeIndex != 0,
 				Command:      log.Command,
-				CommandIndex: log.Index + 1,
+				CommandIndex: log.FakeIndex,
 			}
-			rf.lastAppied = log.Index
+			rf.lastApplied = log.Index
 		}
 	}
 }
 
-func populateAppendReply(rf *Raft, args *AppendArgs, asFollower bool) (re *AppendReply) {
-	re = &AppendReply{
-		Term:           rf.currentTerm,
-		PrevKnownIndex: -1,
-		PrevKnownTerm:  -1,
-		Success:        false,
-	}
+const (
+	_LogBeginningGuard = -1 // log doesn't exist yet
+	_LogNotFound       = -2 // invalid log's index
+)
 
-	if callTerm := args.Term; callTerm >= rf.currentTerm && (asFollower || callTerm != rf.currentTerm) {
-		re.Term = callTerm
-		re.Success = len(args.Entries) <= 0 ||
-			(findLog(rf, args.PrevLogIndex, args.PrevLogTerm) >= -1)
-
-		if !re.Success {
-			if lastKnown := findLogOfTerm(rf, args.PrevLogTerm); lastKnown != nil {
-				re.PrevKnownIndex = lastKnown.Index
-				re.PrevKnownTerm = lastKnown.Term
-			}
-		}
-	}
-	return
-}
-
-func processAppend(rf *Raft, args *AppendArgs, re *AppendReply) (termChanged bool) {
-	if termChanged = (re.Term > rf.currentTerm); termChanged {
-		rf.currentTerm = re.Term
-		rf.votedFor = -1
-		rf.persist()
-	}
-
-	if re.Success {
-		if len(args.Entries) > 0 {
-			// rf.DPrintf("prepare to update log after %v @ %v: %v", args.PrevLogIndex, args.PrevLogTerm, args.Entries)
-			updateLog(rf, findLog(rf, args.PrevLogIndex, args.PrevLogTerm)+1, args.Entries)
-			rf.persist()
-		}
-
-		leaderCommit := args.LeaderCommit
-		lastIdx := rf.lastIndex()
-		if leaderCommit > rf.commitIndex {
-			if leaderCommit > lastIdx {
-				rf.commitIndex = lastIdx
-			} else {
-				rf.commitIndex = leaderCommit
-			}
-			rf.commit()
-		}
-	}
-	return
-}
-
-func populateRequestReply(rf *Raft, args *RequestArgs) (re *RequestReply) {
-	re = &RequestReply{rf.currentTerm, false}
-
-	// rf.DPrintf("lastLog: %+v, LastIndex: %v, LastTerm: %v", rf.lastLog(), args.LastLogIndex, args.LastLogTerm)
-	if callTerm := args.Term; callTerm >= rf.currentTerm {
-		re.Term = callTerm
-		if (callTerm > rf.currentTerm ||
-			rf.votedFor == -1 ||
-			rf.votedFor == args.CandidateId) &&
-			compareLog(rf.lastLog(), args.LastLogIndex, args.LastLogTerm) {
-			re.VoteGranted = true
-		}
-	}
-	return
-}
-
-func postProcessRequest(rf *Raft, args *RequestArgs, re *RequestReply) (termChanged bool) {
-	if termChanged = re.Term > rf.currentTerm; termChanged {
-		rf.currentTerm = re.Term
-	}
-
-	if re.VoteGranted {
-		rf.votedFor = args.CandidateId
+func (rf *Raft) getLog(index, term int) *Log {
+	if idx := rf.getLogOffset(index, term); idx >= 0 {
+		return &rf.logs[idx]
 	} else {
-		rf.votedFor = -1
+		return nil
 	}
-	rf.persist()
+}
+
+func (rf *Raft) getLogByIndex(index int) *Log {
+	if idx := rf.getLogOffsetByIndex(index); idx >= 0 {
+		return &rf.logs[idx]
+	}
+	return nil
+}
+
+// Returns the last log whose term <= given `term`
+func (rf *Raft) seekBaseline(term int) (baseline *Log) {
+	for i, log := range rf.logs {
+		if log.Term >= term {
+			if i > 0 {
+				return &rf.logs[i-1]
+			} else {
+				return nil
+			}
+		}
+		//if log.Term > term {
+		//	break
+		//}
+		//
+		//if baseline == nil || baseline.Term < log.Term {
+		//	baseline = &rf.logs[i]
+		//}
+	}
 	return
 }
 
-func findLogOfIndex(rf *Raft, index int) int {
+// get the offset in logs by given log's index
+//
+// if `index` < 0, then return _LogBeginningGuard
+//
+// if `index` doesn't match any log in current logs collection,
+// then return _LogNotFound
+func (rf *Raft) getLogOffsetByIndex(index int) int {
 	if index < 0 {
-		return -1
+		return _LogBeginningGuard
 	}
-	realIndex := index - rf.logBase
+	realIndex := index - rf.baseLogIndex
 	if realIndex < 0 || realIndex >= len(rf.logs) {
-		return -2
+		return _LogNotFound
 	}
 	return realIndex
 }
 
-func findLogOfTerm(rf *Raft, term int) (lastKnown *Log) {
-	lastKnown = nil
-	for i, log := range rf.logs {
-		if log.Term > term {
-			break
-		}
-		if lastKnown == nil || lastKnown.Term < log.Term {
-			lastKnown = &rf.logs[i]
-		}
-	}
-	return
-}
-
-func findLog(rf *Raft, index, term int) int {
+func (rf *Raft) getLogOffset(index, term int) int {
 	if index == -1 && term == -1 {
-		return -1
+		return _LogBeginningGuard
 	}
 
-	if idx := findLogOfIndex(rf, index); idx >= 0 {
+	if idx := rf.getLogOffsetByIndex(index); idx >= 0 {
 		if rf.logs[idx].Term == term {
 			return idx
 		}
 	}
-	return -2
+	return _LogNotFound
 }
 
-func updateLog(rf *Raft, startIdx int, newLogs []Log) {
-	oldIdx, newIdx := startIdx, 0
-	oldBound, newBound := len(rf.logs), len(newLogs)
-
-	for oldIdx < oldBound && newIdx < newBound {
-		rf.logs[oldIdx] = newLogs[newIdx]
-		oldIdx++
-		newIdx++
+func (rf *Raft) compareLog(logIndex int, logTerm int) bool {
+	var lastLog *Log = nil
+	if lastIndex := len(rf.logs); lastIndex > 0 {
+		lastLog = &rf.logs[lastIndex-1]
 	}
 
-	rf.logs = rf.logs[:oldIdx]
-	rf.logs = append(rf.logs, newLogs[newIdx:]...)
-	//	rf.DPrintf("log updated(from %v), new logs: %v", startIdx, rf.logs)
-
-	rf.persist()
-}
-
-func compareLog(lastLog *Log, logIndex int, logTerm int) bool {
 	return lastLog == nil ||
 		(logTerm > lastLog.Term ||
 			(logTerm == lastLog.Term && logIndex >= lastLog.Index))
 }
+
+func (rf *Raft) lastIndex() int {
+	if logsNum := len(rf.logs); logsNum > 0 {
+		return rf.logs[logsNum-1].Index
+	} else {
+		return -1
+	}
+}
+
+type character interface {
+	loop()
+	issueAppend(*AppendArgs) *AppendReply
+	issueRequest(*RequestArgs) *RequestReply
+	issueQuery() int
+	stop()
+}
+
+type commandCall struct {
+	command  interface{}
+	retrying bool
+	resultCh chan int
+}
+
+type appendCall struct {
+	args    *AppendArgs
+	replyCh chan *AppendReply
+}
+
+type requestCall struct {
+	args    *RequestArgs
+	replyCh chan *RequestReply
+}
+
+type queryCall chan int

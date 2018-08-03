@@ -1,9 +1,10 @@
 package raft
 
 import (
+	"labrpc"
 	"bytes"
 	"labgob"
-	"labrpc"
+	"unsafe"
 )
 
 // import "bytes"
@@ -18,61 +19,118 @@ type Log struct {
 	Term    int
 	Index   int
 	Command interface{}
-}
 
-const (
-	Follower  = 0
-	Candidate = 1
-	Leader    = 2
-	Quit      = 3
-	Total     = 4
-)
-
-type Query struct {
-	ch chan int
+	FakeIndex int
 }
 
 type Raft struct {
 	applyCh chan ApplyMsg
 
-	stateChan [Total]chan bool
-
-	appendCallQueue  chan *ACall
-	requestCallQueue chan *RCall
-
-	commandQueue chan *commandTask
-	query        chan *Query
-
 	peers     []*labrpc.ClientEnd
+	majority  int // cached majority number
 	persister *Persister
 	me        int
 
-	logBase int
+	baseLogIndex int
 
 	// persistent props
 	currentTerm int
 	votedFor    int
 	logs        []Log
+	fakeIndex   int // fake index to report to tester. see commit in raft_leader.go for details.
 
 	// volatile props
 	commitIndex int
-	lastAppied  int
+	lastApplied int
 
-	// volatile leader props
-	nextIndex  []int
-	matchIndex []int
+	currentCharacter unsafe.Pointer
+}
+
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) (rf *Raft) {
+
+	rf = &Raft{
+		peers:     peers,
+		majority:  calcMajority(len(peers)),
+		persister: persister,
+		me:        me,
+
+		baseLogIndex: 0,
+
+		fakeIndex:   0,
+		currentTerm: 0,
+		votedFor:    -1,
+
+		commitIndex: -1,
+		lastApplied: -1,
+
+		applyCh: applyCh,
+	}
+	rf.setCharacter(rf.makeFollower())
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	rf.getCharacter().loop()
+
+	return
+}
+
+func (rf *Raft) Kill() {
+	rf.DPrintf("- stop -")
+	var mark character = nil
+	for character := rf.getCharacter(); character != mark; character = rf.getCharacter() {
+		character.stop()
+		mark = character
+	}
 }
 
 func (rf *Raft) GetState() (int, bool) {
-	q := &Query{make(chan int, 2)}
-	rf.query <- q
-	return int(<-q.ch), (<-q.ch == Leader)
+	for character := rf.getCharacter(); ; character = rf.getCharacter() {
+		if term := character.issueQuery(); term != -1 {
+			_, isLeader := character.(*leader)
+			return term, isLeader
+		}
+	}
+}
+
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	for character := rf.getCharacter(); ; character = rf.getCharacter() {
+		if term = character.issueQuery(); term != -1 {
+			var l *leader
+			if l, isLeader = character.(*leader); isLeader {
+				if index = l.issueCommand(command); index == -1 {
+					isLeader = false
+				}
+			}
+			return
+		}
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendArgs, reply *AppendReply) {
+	for {
+		if re := rf.getCharacter().issueAppend(args); re != nil {
+			*reply = *re
+			return
+		}
+	}
+}
+
+func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
+	for {
+		if re := rf.getCharacter().issueRequest(args); re != nil {
+			*reply = *re
+			return
+		}
+	}
 }
 
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
+	e.Encode(rf.fakeIndex)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
@@ -88,111 +146,15 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	var currentTerm int
-	var voteFor int
+	var fakeIndex, currentTerm, votedFor int
 	var logs []Log
-
-	if d.Decode(&currentTerm) == nil &&
-		d.Decode(&voteFor) == nil &&
+	if d.Decode(&fakeIndex) == nil &&
+		d.Decode(&currentTerm) == nil &&
+		d.Decode(&votedFor) == nil &&
 		d.Decode(&logs) == nil {
+		rf.fakeIndex = fakeIndex
 		rf.currentTerm = currentTerm
-		rf.votedFor = voteFor
+		rf.votedFor = votedFor
 		rf.logs = logs
 	}
-}
-
-func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
-	// rf.DPrintf("start query")
-	select {
-	case <-rf.stateChan[Quit]:
-		return -1, -1, false
-	default:
-	}
-	term, isLeader = rf.GetState()
-	if !isLeader {
-		return -1, -1, false
-	}
-	newTask := &commandTask{
-		command: command,
-		index:   make(chan int),
-	}
-	rf.commandQueue <- newTask
-	index = <-newTask.index + 1
-
-	// rf.DPrintf("start %v %v %v %v", index, term, isLeader, rf.logs)
-
-	return
-}
-
-func (rf *Raft) Kill() {
-	close(rf.stateChan[Quit])
-	//	rf.DPrintf("killed, term: %v, votedFor: %v, logs: %v", rf.currentTerm, rf.votedFor, rf.logs)
-}
-
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) (rf *Raft) {
-
-	rf = &Raft{
-		peers:     peers,
-		persister: persister,
-		me:        me,
-
-		logBase: 0,
-
-		currentTerm: 0,
-		votedFor:    -1,
-		logs:        nil,
-
-		commitIndex: -1,
-		lastAppied:  -1,
-
-		nextIndex:  make([]int, len(peers)),
-		matchIndex: make([]int, len(peers)),
-
-		requestCallQueue: make(chan *RCall, 10),
-		appendCallQueue:  make(chan *ACall, 10),
-
-		commandQueue: make(chan *commandTask, 100),
-
-		applyCh: applyCh,
-
-		query: make(chan *Query),
-	}
-
-	for i := 0; i < Total; i++ {
-		rf.stateChan[i] = make(chan bool)
-	}
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	go rf.runFollower()
-	go rf.runCandidate()
-	go rf.runLeader()
-
-	//	rf.DPrintf("started, term: %v, votedFor: %v, logs: %v", rf.currentTerm, rf.votedFor, rf.logs)
-
-	rf.stateChan[Follower] <- true
-
-	return
-}
-
-func (rf *Raft) AppendEntries(args *AppendArgs, reply *AppendReply) {
-	call := &ACall{
-		args:  args,
-		reply: make(chan *AppendReply, 1),
-	}
-	rf.appendCallQueue <- call
-	*reply = *(<-call.reply)
-}
-
-func (rf *Raft) RequestVote(args *RequestArgs, reply *RequestReply) {
-	// rf.DPrintf("receive request: %+v", args)
-	call := &RCall{
-		args:  args,
-		reply: make(chan *RequestReply, 1),
-	}
-	rf.requestCallQueue <- call
-	*reply = *(<-call.reply)
-	// rf.DPrintf("reply request: %+v", args)
 }

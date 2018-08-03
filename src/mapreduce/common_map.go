@@ -99,7 +99,7 @@ func doMap(
 	// argument should be the input file name, though the map function
 	// typically ignores it. The second argument should be the entire
 	// input file contents. mapF() returns a slice containing the
-	// key/value pairs for reduce; see common.go for the definition of
+	// key/value pairs for reduce; see raft_common.go for the definition of
 	// KeyValue.
 	//
 	// Look at Go's ioutil and os packages for functions to read

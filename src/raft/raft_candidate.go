@@ -1,271 +1,220 @@
 package raft
 
 import (
-	"labrpc"
 	"time"
+	"labrpc"
 )
 
-func (rf *Raft) runCandidate() {
-	for {
-		select {
-		case <-rf.stateChan[Quit]:
-			return
-
-		case <-rf.stateChan[Candidate]:
-			//			rf.DPrintf("candidate %v", rf.logs)
-			rf.performCandidate()
-		}
-	}
-}
-
-func (rf *Raft) performCandidate() {
-	candidate := rf.makeCandidate()
-	go candidate.loop()
-
-	select {
-	case <-rf.stateChan[Quit]:
-
-	case <-candidate.fallbackChan:
-		rf.stateChan[Follower] <- true
-
-	case <-candidate.promoteChan:
-		rf.stateChan[Leader] <- true
-	}
-}
-
 type candidate struct {
-	rf *Raft
+	*Raft
+	*eventLoop
 
-	currentTask *electionTask
-
-	waitTimer    <-chan time.Time
-	fallbackChan chan bool
-	promoteChan  chan bool
-
-	stop chan bool
+	grantedNumber   int
+	electionTimeout *time.Timer
 }
 
-func (rf *Raft) makeCandidate() *candidate {
-	return &candidate{
-		rf:           rf,
-		fallbackChan: make(chan bool, 1),
-		promoteChan:  make(chan bool, 1),
-		stop:         make(chan bool),
+func (candidate *candidate) issueAppend(args *AppendArgs) (re *AppendReply) {
+	call := &appendCall{args, make(chan *AppendReply, 1)}
+	if candidate.fireEvent(_MsgAppend, call) {
+		return <-call.replyCh
+	} else { // indicates candidate has stopped
+		return nil
 	}
 }
 
-func (candidate *candidate) resetTimer() {
-	candidate.waitTimer = electionTimeOut()
+func (candidate *candidate) issueRequest(args *RequestArgs) (re *RequestReply) {
+	call := &requestCall{args, make(chan *RequestReply, 1)}
+	if candidate.fireEvent(_MsgRequest, call) {
+		return <-call.replyCh
+	} else { // indicates candidate has stopped
+		return nil
+	}
 }
 
-func (candidate *candidate) makeRequestArgs() (args *RequestArgs) {
-	rf := candidate.rf
-	args = &RequestArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: -1,
-		LastLogTerm:  -1,
+func (candidate *candidate) issueQuery() int {
+	var query queryCall = make(chan int, 1)
+	if candidate.fireEvent(_MsgQuery, query) {
+		return <-query
+	} else {
+		return -1
+	}
+}
+
+type election struct {
+	*candidate
+
+	args RequestArgs
+}
+
+const (
+	_MsgVoteGranted = "granted"
+)
+
+func (rf *Raft) makeCandidate() (c *candidate) {
+	rf.votedFor = rf.me
+	c = &candidate{
+		Raft:      rf,
+		eventLoop: makeEventLoop(len(rf.peers) * 2),
+
+		grantedNumber: 0,
 	}
 
-	if lastLog := rf.lastLog(); lastLog != nil {
-		args.LastLogIndex = lastLog.Index
-		args.LastLogTerm = lastLog.Term
-	}
+	c.registerHandler(_MsgAppend, func(value interface{}) {
+		c.handleAppend(value.(*appendCall))
+	})
+
+	c.registerHandler(_MsgRequest, func(value interface{}) {
+		c.handleRequest(value.(*requestCall))
+	})
+
+	c.registerHandler(_MsgQuery, func(value interface{}) {
+		value.(queryCall) <- c.currentTerm
+	})
+
+	c.registerHandler(_MsgVoteGranted, func(value interface{}) {
+		c.handleVoteGranted(value.(int))
+	})
+
+	c.registerHandler(_MsgTimeout, func(value interface{}) {
+		if value.(int) == c.currentTerm { // Check if this signal is from current term.
+			c.launchElection()
+		}
+	})
+
+	c.registerHandler(_MsgGreaterTerm, func(value interface{}) {
+		futureTerm := value.(int)
+		// check if we have changed our term even greater after the GreaterTerm signal had been issued
+		if futureTerm >= c.currentTerm {
+			c.stop()
+			rf.currentTerm = futureTerm
+			rf.votedFor = -1 // DON'T forget reset votedFor here!
+			rf.persist()
+
+			// switch to follower
+			follower := rf.makeFollower()
+
+			c.transferEventTo(follower.eventLoop, eventFilter)
+
+			rf.setCharacter(follower)
+			follower.loop()
+		}
+	})
+
 	return
 }
 
-func (candidate *candidate) isTerminated() bool {
-	select {
-	case <-candidate.stop:
-		return true
-	default:
-		return false
+func (candidate *candidate) loop() {
+	//candidate.DPrintf("- candidate -")
+	candidate.launchElection() // start election at beginning
+	candidate.start()
+}
+
+func (candidate *candidate) handleAppend(call *appendCall) {
+	// NOTE: please notice the condition of fallback on rpc:
+	// AppendEntries with term >= currentTerm, while
+	// RequestVote with term > currentTerm
+	if args := call.args; args.Term >= candidate.currentTerm {
+		candidate.fireEvent(_MsgGreaterTerm, args.Term)
+		candidate.fireEvent(_MsgAppend, call) // re-enqueue this append args to let it handled by follower
+	} else {
+		call.replyCh <- &AppendReply{
+			Term:    candidate.currentTerm,
+			Success: false,
+		}
 	}
 }
 
-func (candidate *candidate) terminate() {
-	if curTask := candidate.currentTask; curTask != nil {
-		curTask.terminate()
+func (candidate *candidate) handleRequest(call *requestCall) {
+	if args := call.args; args.Term > candidate.currentTerm {
+		candidate.fireEvent(_MsgGreaterTerm, args.Term)
+		candidate.fireEvent(_MsgRequest, call) // re-enqueue this append args to let it handled follower
+	} else {
+		call.replyCh <- &RequestReply{
+			Term:        candidate.currentTerm,
+			VoteGranted: false,
+		}
 	}
-	close(candidate.stop)
 }
 
-func (candidate *candidate) promote() {
-	candidate.terminate()
-	close(candidate.promoteChan)
+func (candidate *candidate) handleVoteGranted(fromTerm int) {
+	if fromTerm == candidate.currentTerm { // Check if the vote is from current term.
+		candidate.grantedNumber++
+
+		// Check if we have won the election.
+		if candidate.grantedNumber >= candidate.majority {
+			candidate.stop()
+
+			rf := candidate.Raft
+			leader := rf.makeLeader()
+			// Switch to leader
+			candidate.transferEventTo(leader.eventLoop, eventFilter)
+
+			candidate.Raft.setCharacter(leader)
+			leader.loop()
+		}
+	}
 }
 
-func (candidate *candidate) fallback(term, votedFor int) {
-	candidate.terminate()
-	candidate.rf.currentTerm = term
-	candidate.rf.votedFor = votedFor
-	candidate.rf.persist()
-	close(candidate.fallbackChan)
+func (candidate *candidate) makeElection() (e *election) {
+	// Prepare RequestVote's argument
+	// Find the last log entry. {-1, -1} if no log ever exists.
+	var lastLog *Log = nil
+	lastLogIndex, lastLogTerm := -1, -1
+	if logsNum := len(candidate.logs); logsNum > 0 {
+		lastLog = &candidate.logs[logsNum-1]
+		lastLogIndex = lastLog.Index
+		lastLogTerm = lastLog.Term
+	}
+
+	return &election{
+		candidate: candidate,
+
+		args: RequestArgs{
+			Term:         candidate.currentTerm,
+			CandidateId:  candidate.me,
+			LastLogTerm:  lastLogTerm,
+			LastLogIndex: lastLogIndex,
+		},
+	}
 }
 
 func (candidate *candidate) launchElection() {
-	if oldTask := candidate.currentTask; oldTask != nil {
-		oldTask.terminate()
-	}
+	// Start the election.
+	candidate.currentTerm++
+	candidate.persist() // Term changing, persist now.
 
-	rf := candidate.rf
-	rf.currentTerm++
-	rf.votedFor = rf.me
+	candidate.grantedNumber = 1 // granted number start from 1 (we have granted vote to ourselves)
 
-	candidate.currentTask = &electionTask{
-		rf:         rf,
-		args:       candidate.makeRequestArgs(),
-		granted:    1,
-		respChan:   make(chan int, len(rf.peers)),
-		reportChan: make(chan int, 1),
-		stop:       make(chan bool),
-	}
-	candidate.currentTask.runSenders()
-	go candidate.currentTask.waitForResult()
-
+	candidate.makeElection().start()
 	candidate.resetTimer()
 }
 
-func (candidate *candidate) handleReport(report int) {
-	if report == OperationSucceed {
-		candidate.promote()
-	} else {
-		candidate.fallback(report, -1)
+func (candidate *candidate) resetTimer() {
+	if candidate.electionTimeout != nil {
+		candidate.electionTimeout.Stop()
 	}
+	currentTerm := candidate.currentTerm // extract currentTerm to capture-by-value by the anonymous function
+	candidate.electionTimeout = time.AfterFunc(electionTimeOut(), func() {
+		candidate.fireEvent(_MsgTimeout, currentTerm)
+	})
 }
 
-func (candidate *candidate) handleRequestCall(call *RCall) {
-	rf := candidate.rf
-	args := call.args
-	re := populateRequestReply(rf, args)
-	call.reply <- re
-
-	// assertion can be made that never is request with same term granted
-	if postProcessRequest(rf, args, re) {
-		candidate.fallback(args.Term, rf.votedFor)
-	}
-}
-
-func (candidate *candidate) handleAppendCall(call *ACall) {
-	rf := candidate.rf
-	args := call.args
-	re := populateAppendReply(rf, args, false)
-	call.reply <- re
-
-	if processAppend(rf, args, re) {
-		candidate.fallback(args.Term, -1)
-	}
-}
-
-func (candidate *candidate) loop() {
-	candidate.launchElection()
-
-	for !candidate.isTerminated() {
-		select {
-		case <-candidate.stop:
-			return
-
-		case q := <-candidate.rf.query:
-			q.ch <- candidate.rf.currentTerm
-			q.ch <- Candidate
-
-		case <-candidate.waitTimer:
-			candidate.launchElection()
-
-		case report := <-candidate.currentTask.reportChan:
-			candidate.handleReport(report)
-
-		case call := <-candidate.rf.appendCallQueue:
-			candidate.handleAppendCall(call)
-
-		case call := <-candidate.rf.requestCallQueue:
-			candidate.handleRequestCall(call)
-		}
-	}
-
-}
-
-type electionTask struct {
-	rf *Raft
-
-	args    *RequestArgs
-	granted int
-
-	respChan   chan int
-	reportChan chan int
-	stop       chan bool
-}
-
-func (task *electionTask) terminate() {
-	select {
-	case <-task.stop:
-	default:
-		close(task.stop)
-	}
-}
-
-func (task *electionTask) isTerminated() bool {
-	select {
-	case <-task.stop:
-		return true
-	default:
-		return false
-	}
-}
-
-func (task *electionTask) report(report int) {
-	task.terminate()
-	task.reportChan <- report
-}
-
-func (task *electionTask) runSenders() {
-	rf := task.rf
-	for i, peer := range rf.peers {
-		if i != rf.me {
-			go func(i int, peer *labrpc.ClientEnd) {
-				result := doSendRequest(task.args, peer)
-				select {
-				case <-task.stop:
-				case task.respChan <- result:
-				}
-			}(i, peer)
+func (e *election) start() {
+	for peerIndex, peer := range e.peers {
+		if peerIndex != e.me {
+			go e.sendTo(peer)
 		}
 	}
 }
 
-func (task *electionTask) waitForResult() {
-	majority := calcMajority(len(task.rf.peers))
-	for !task.isTerminated() {
-		select {
-		case <-task.stop:
-			return
-
-		case resp := <-task.respChan:
-			if resp == OperationSucceed {
-				task.granted++
-				if task.granted >= majority {
-					task.report(OperationSucceed)
-				}
-			} else if resp > 0 {
-				task.report(resp)
-			}
-		}
-	}
-}
-
-func doSendRequest(args *RequestArgs, peer *labrpc.ClientEnd) int {
+func (e *election) sendTo(peer *labrpc.ClientEnd) {
 	re := &RequestReply{}
-	if result := peer.Call("Raft.RequestVote", args, re); result {
+
+	if result := tryCall(peer, "Raft.RequestVote", &e.args, re); result {
 		if re.VoteGranted {
-			return OperationSucceed
-		} else {
-			if re.Term > args.Term {
-				return re.Term
-			} else {
-				return VoteDenied
-			}
+			e.fireEvent(_MsgVoteGranted, e.args.Term)
+		} else if re.Term > e.args.Term {
+			e.fireEvent(_MsgGreaterTerm, re.Term)
 		}
-	} else {
-		return CallFail
-	}
+	} // we don't have to handle the network error.
 }
